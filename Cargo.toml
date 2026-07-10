@@ -1,0 +1,16 @@
+[package]
+name = "bless"
+version = "0.1.0"
+edition = "2021"
+description = "A blessed less: Rust pager with libghostty-vt SGR parsing and syntax highlighting"
+license = "MIT"
+repository = "https://github.com/th0jensen/bless"
+readme = "README.md"
+keywords = ["pager", "terminal", "less", "ghostty"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+libghostty-vt = { version = "0.2", default-features = false, features = ["link-dynamic"] }
+libghostty-vt-sys = { version = "0.2", default-features = false, features = ["pkg-config", "link-dynamic"] }
