@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::{
     render::{char_width, display_width, fit_width, render_line},
-    terminal::{poll_fd, read_input, Input, Terminal},
+    terminal::{poll_fd, read_input, read_prompt_input, Input, Terminal},
     text::Line,
 };
 
@@ -162,7 +162,7 @@ impl App {
         loop {
             write!(out, "\x1b[{};1H\x1b[2K/{q}", h)?;
             out.flush()?;
-            match read_input(tty)? {
+            match read_prompt_input(tty)? {
                 Input::Char('\n') => break,
                 Input::Quit => return Ok(()),
                 Input::Char('\x08') => {

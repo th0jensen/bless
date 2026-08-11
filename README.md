@@ -14,25 +14,31 @@
 
 ## Build
 
-Requires Rust and `libghostty-vt` development files visible to `pkg-config` for dynamic system linking. The Rust integration uses the safe `libghostty-vt` crate.
+Requires Rust and [Zig](https://ziglang.org) 0.16+. `libghostty-vt` is built from source and statically linked: the `vendor/ghostty` git submodule tracks the tip of upstream [ghostty](https://github.com/ghostty-org/ghostty)'s `main` branch, and `.cargo/config.toml` points the `libghostty-vt-sys` build script at it via `GHOSTTY_SOURCE_DIR`. The Rust integration uses the safe `libghostty-vt` crate.
 
-Runtime dependencies are intentionally tiny: `anyhow`, `libc`, and system `libghostty-vt`.
+The resulting binary has no runtime dependency on a system or bundled `libghostty-vt` — it's statically linked in. Runtime dependencies are intentionally tiny: just `anyhow` and `libc`.
+
+Because it tracks ghostty's tip rather than a pinned release, the vendored C API can drift from what the `libghostty-vt` crate's checked-in bindings expect. Run `just update-ghostty` to fast-forward the submodule and rebuild to catch breakage early.
 
 Large-file safeguards: `bless` loads at most 256 MiB by default and caps parsed lines at 1,000,000. Override bytes with `BLESS_MAX_BYTES`, e.g. `BLESS_MAX_BYTES=1GiB bls huge.log`.
 
 `bless` follows Unix operand style: it does not read stdin implicitly. Use the installed command shorthand, `bls -`, for pipelines.
 
 ```sh
+git clone --recurse-submodules https://github.com/th0jensen/bless.git
+cd bless
 cargo build --release
 ```
+
+If you already cloned without `--recurse-submodules`, run `git submodule update --init` first.
 
 ## Install from source
 
 ```sh
-make install
+just install
 ```
 
-`make install` detects the host platform without an explicit Cargo `--target`. Source installs avoid system/package-manager prefixes by default: `~/.local` on Linux/other Unix and `~/.local/bless` on macOS.
+`just install` (or bare `just`, which builds the release binary and man page) detects the host platform without an explicit Cargo `--target`. Source installs avoid system/package-manager prefixes by default: `~/.local` on Linux/other Unix and `~/opt` on macOS.
 
 macOS already ships Apple's `/usr/sbin/bless` utility. To avoid shadowing a system administration command while keeping one command name across platforms, the installed command shorthand is `bls` everywhere. The program, project, and package are still named `bless`. Override `INSTALL_NAME`, `PREFIX`, `BINDIR`, or `MANDIR` if needed; packaging recipes should set their own prefix explicitly.
 

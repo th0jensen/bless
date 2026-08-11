@@ -114,6 +114,31 @@ pub(crate) fn read_input(tty: &mut fs::File) -> Result<Input> {
     })
 }
 
+/// Reads a single byte as raw text-entry input for prompts (e.g. search),
+/// without the normal-mode vim navigation bindings from `read_input`, so
+/// query text can contain any character, including g/h/j/k/l/n/N/q/d/u.
+pub(crate) fn read_prompt_input(tty: &mut fs::File) -> Result<Input> {
+    let mut b = [0u8; 1];
+    tty.read_exact(&mut b)?;
+    Ok(match b[0] {
+        3 => Input::Quit,
+        0x1b => {
+            if poll_fd(tty.as_raw_fd(), Duration::from_millis(1))? {
+                // Part of an escape sequence (e.g. an arrow key): the prompt
+                // has no in-line cursor movement, so just consume and drop it.
+                read_escape(tty)?;
+                Input::Ignore
+            } else {
+                Input::Quit
+            }
+        }
+        b'\r' | b'\n' => Input::Char('\n'),
+        0x7f => Input::Char('\x08'),
+        c if c.is_ascii() => Input::Char(c as char),
+        _ => Input::Ignore,
+    })
+}
+
 fn read_escape(tty: &mut fs::File) -> Result<Input> {
     let mut seq = Vec::new();
     while poll_fd(tty.as_raw_fd(), Duration::from_millis(1))? {
@@ -138,14 +163,31 @@ fn read_escape(tty: &mut fs::File) -> Result<Input> {
 }
 
 pub(crate) fn poll_fd(fd: i32, timeout: Duration) -> Result<bool> {
-    let mut fds = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let rc = unsafe { libc::poll(&mut fds, 1, timeout.as_millis() as i32) };
-    if rc < 0 {
-        bail!("poll failed");
+    // select(2), not poll(2): Darwin's poll() is broken on character devices
+    // (returns immediately with POLLNVAL on /dev/tty), which made the input
+    // drain loop block on the next keypress before repainting. select() works
+    // correctly on both macOS and Linux. The tty fd is always a small number,
+    // well below FD_SETSIZE.
+    let mut set = unsafe { std::mem::zeroed::<libc::fd_set>() };
+    unsafe {
+        libc::FD_ZERO(&mut set);
+        libc::FD_SET(fd, &mut set);
     }
-    Ok(rc > 0)
+    let mut tv = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    let rc = unsafe {
+        libc::select(
+            fd + 1,
+            &mut set,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut tv,
+        )
+    };
+    if rc < 0 {
+        bail!("select failed");
+    }
+    Ok(rc > 0 && unsafe { libc::FD_ISSET(fd, &set) })
 }
