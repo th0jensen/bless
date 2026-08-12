@@ -5,34 +5,42 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use indoc::printdoc;
 
 use crate::MAX_LOAD_BYTES;
 
 pub(crate) fn print_help(command_name: &str) {
-    println!(
-        "Usage: {command_name} [OPTION]... [FILE]
+    printdoc! {"
+        Usage: {command_name} [OPTION]... [FILE]
 
-bless: a small Ghostty-oriented pager with libghostty-vt SGR parsing.
-The installed command is a shorthand to avoid conflicting with macOS bless(8).
+        bless: a small Ghostty-oriented pager with libghostty-vt SGR parsing.
+        The installed command is a shorthand to avoid conflicting with macOS bless(8).
 
-Arguments:
-  FILE                  File to view. Use '-' to read standard input.
-                        If standard input is a pipe, FILE may be omitted.
+        Arguments:
+          FILE                  File to view. Use '-' to read standard input.
+                                If standard input is a pipe, FILE may be omitted.
 
-Options:
-  -h, --help            Display this help and exit.
+        Options:
+          -h, --help            Display this help and exit.
 
-Environment:
-  BLESS_MAX_BYTES=SIZE  Maximum bytes to load (default: 256MiB).
-                        SIZE accepts B, KiB, MiB, GiB suffixes."
-    );
+        Environment:
+          BLESS_MAX_BYTES=SIZE  Maximum bytes to load (default: 64MiB).
+                                SIZE accepts B, KiB, MiB, GiB suffixes.
+        "
+    };
 }
 
 pub(crate) fn read_limited(
     args: &[String],
     command_name: &str,
 ) -> Result<(String, Option<PathBuf>, String, Option<String>)> {
+    if args.len() > 1 {
+        bail!(
+            "extra operand '{}'\nTry '{command_name} --help' for more information.",
+            args[1]
+        );
+    }
     let Some(file) = args.first() else {
         if stdin_is_tty() {
             bail!("missing operand\nTry '{command_name} --help' for more information.");
@@ -114,15 +122,14 @@ fn parse_bytes(s: &str) -> Option<u64> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let n: u64 = s[..split].parse().ok()?;
     let unit = s[split..].trim().to_ascii_lowercase();
-    Some(
-        n * match unit.as_str() {
-            "" | "b" => 1,
-            "k" | "kb" | "kib" => 1024,
-            "m" | "mb" | "mib" => 1024 * 1024,
-            "g" | "gb" | "gib" => 1024 * 1024 * 1024,
-            _ => return None,
-        },
-    )
+    let multiplier = match unit.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    n.checked_mul(multiplier)
 }
 
 fn human_bytes(n: u64) -> String {
@@ -137,5 +144,18 @@ fn human_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_byte_limits_without_overflow() {
+        assert_eq!(parse_bytes("64MiB"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_bytes("2 gb"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("bogus"), None);
+        assert_eq!(parse_bytes("18446744073709551615GiB"), None);
     }
 }
