@@ -129,7 +129,7 @@ man:
     .SH ENVIRONMENT
     .TP
     .B BLESS_MAX_BYTES
-    Maximum number of bytes to load. The default is 256MiB. Values may use
+    Maximum number of bytes to load. The default is 64MiB. Values may use
     .BR B ,
     .BR KiB ,
     .BR MiB ,

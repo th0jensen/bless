@@ -13,7 +13,7 @@ use app::App;
 use cli::{print_help, read_limited};
 use text::{highlight_text, parse_ansi};
 
-pub(crate) const MAX_LOAD_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_LOAD_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_LINES: usize = 1_000_000;
 
 fn main() -> Result<()> {
@@ -40,6 +40,8 @@ fn main() -> Result<()> {
     } else {
         (highlight_text(&input, path.as_ref()), None)
     };
+
+    drop(input);
 
     if lines.len() >= MAX_LINES {
         let msg = format!("line cap reached ({MAX_LINES})");

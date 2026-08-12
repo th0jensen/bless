@@ -8,9 +8,11 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    render::{char_width, display_width, fit_width, render_line},
-    terminal::{poll_fd, read_input, read_prompt_input, Input, Terminal},
-    text::Line,
+    render::{display_width, fit_width, line_matches, line_width, render_line},
+    terminal::{
+        Input, Terminal, WaitEvent, poll_fd, read_input, read_prompt_input, wait_for_event,
+    },
+    text::{Line, sanitize_terminal_text},
 };
 
 pub(crate) struct App {
@@ -18,6 +20,7 @@ pub(crate) struct App {
     raw_lines: Option<Vec<String>>,
     name: String,
     notice: Option<String>,
+    max_line_width: usize,
     top: usize,
     left: usize,
     search: Option<String>,
@@ -26,8 +29,6 @@ pub(crate) struct App {
     last: Option<View>,
     last_rows: Vec<String>,
     last_status: String,
-    last_widths: Vec<usize>,
-    last_status_width: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -46,11 +47,13 @@ impl App {
         name: String,
         notice: Option<String>,
     ) -> Self {
+        let max_line_width = lines.iter().map(line_width).max().unwrap_or(0);
         Self {
             lines,
             raw_lines,
-            name,
-            notice,
+            name: sanitize_terminal_text(&name),
+            notice: notice.map(|text| sanitize_terminal_text(&text)),
+            max_line_width,
             top: 0,
             left: 0,
             search: None,
@@ -59,32 +62,40 @@ impl App {
             last: None,
             last_rows: Vec::new(),
             last_status: String::new(),
-            last_widths: Vec::new(),
-            last_status_width: 0,
         }
     }
 
     pub(crate) fn run(&mut self) -> Result<()> {
         let mut out = io::stdout();
         let mut terminal = Terminal::enter(&mut out)?;
-        self.event_loop(&mut out, &mut terminal.tty)
+        let resize_fd = terminal.resize_fd();
+        self.event_loop(&mut out, &mut terminal.tty, resize_fd)
     }
 
-    fn event_loop(&mut self, out: &mut io::Stdout, tty: &mut fs::File) -> Result<()> {
+    fn event_loop(
+        &mut self,
+        out: &mut io::Stdout,
+        tty: &mut fs::File,
+        resize_fd: i32,
+    ) -> Result<()> {
         self.draw(out)?;
         loop {
             let before = self.state_key();
-            let input = read_input(tty)?;
-            let (cont, mut dirty) = self.handle_input(out, tty, input)?;
-            if !cont {
-                break;
-            }
-            while poll_fd(tty.as_raw_fd(), Duration::from_millis(0))? {
+            let mut dirty = false;
+            if let WaitEvent::Input = wait_for_event(tty.as_raw_fd(), resize_fd)? {
                 let input = read_input(tty)?;
-                let (cont, d) = self.handle_input(out, tty, input)?;
-                dirty |= d;
+                let (cont, d) = self.handle_input(out, tty, input, resize_fd)?;
+                dirty = d;
                 if !cont {
-                    return Ok(());
+                    break;
+                }
+                while poll_fd(tty.as_raw_fd(), Duration::from_millis(0))? {
+                    let input = read_input(tty)?;
+                    let (cont, d) = self.handle_input(out, tty, input, resize_fd)?;
+                    dirty |= d;
+                    if !cont {
+                        return Ok(());
+                    }
                 }
             }
             self.clamp_view();
@@ -100,8 +111,12 @@ impl App {
         out: &mut io::Stdout,
         tty: &mut fs::File,
         input: Input,
+        resize_fd: i32,
     ) -> Result<(bool, bool)> {
         let mut dirty = false;
+        if self.cycle_match_for_direction(&input) {
+            return Ok((true, false));
+        }
         match input {
             Input::Quit => return Ok((false, false)),
             Input::Down => self.scroll(1),
@@ -113,12 +128,11 @@ impl App {
             Input::Right => self.left = (self.left + 4).min(self.max_left()),
             Input::Left => self.left = self.left.saturating_sub(4),
             Input::Search => {
-                self.prompt_search(out, tty)?;
+                self.prompt_search(out, tty, resize_fd)?;
                 dirty = true;
             }
             Input::Next => self.next_match(false),
             Input::Prev => self.next_match(true),
-            // BEL and other ignored/control input should not cause a repaint.
             _ => {}
         }
         Ok((true, dirty))
@@ -138,13 +152,8 @@ impl App {
     }
 
     fn max_left(&self) -> usize {
-        let width = Terminal::size().0 as usize;
-        self.lines
-            .iter()
-            .map(|line| line.iter().map(|c| char_width(c.ch)).sum::<usize>())
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(width)
+        self.max_line_width
+            .saturating_sub(Terminal::size().0 as usize)
     }
 
     fn clamp_left(&mut self) {
@@ -156,12 +165,25 @@ impl App {
         self.clamp_left();
     }
 
-    fn prompt_search(&mut self, out: &mut io::Stdout, tty: &mut fs::File) -> Result<()> {
-        let (_, h) = Terminal::size();
+    fn prompt_search(
+        &mut self,
+        out: &mut io::Stdout,
+        tty: &mut fs::File,
+        resize_fd: i32,
+    ) -> Result<()> {
+        let mut prompt_row = Terminal::size().1;
         let mut q = String::new();
         loop {
-            write!(out, "\x1b[{};1H\x1b[2K/{q}", h)?;
+            let (_, current_row) = Terminal::size();
+            if current_row != prompt_row {
+                write!(out, "\x1b[{};1H\x1b[2K", prompt_row)?;
+                prompt_row = current_row;
+            }
+            write!(out, "\x1b[{};1H\x1b[2K/{q}", prompt_row)?;
             out.flush()?;
+            if let WaitEvent::Resize = wait_for_event(tty.as_raw_fd(), resize_fd)? {
+                continue;
+            }
             match read_prompt_input(tty)? {
                 Input::Char('\n') => break,
                 Input::Quit => return Ok(()),
@@ -189,13 +211,24 @@ impl App {
         let Some(q) = &self.search else {
             return;
         };
-        let q = q.to_lowercase();
-        for (i, l) in self.lines.iter().enumerate() {
-            let s: String = l.iter().map(|c| c.ch).collect();
-            if s.to_lowercase().contains(&q) {
+        for (i, line) in self.lines.iter().enumerate() {
+            if line_matches(line, q) {
                 self.matches.push(i);
             }
         }
+    }
+
+    fn cycle_match_for_direction(&mut self, input: &Input) -> bool {
+        let prev = match input {
+            Input::Up | Input::Left => true,
+            Input::Down | Input::Right => false,
+            _ => return false,
+        };
+        if self.matches.is_empty() {
+            return false;
+        }
+        self.next_match(prev);
+        true
     }
 
     fn next_match(&mut self, prev: bool) {
@@ -228,43 +261,28 @@ impl App {
         let old = self.last;
         let mut frame = String::with_capacity(width.saturating_mul(h as usize + 1));
 
-        // Damage rendering. No per-frame synchronized-update toggling and no
-        // unconditional erase-to-EOL: both can look like flicker in Ghostty.
         frame.push_str("\x1b[?25l\x1b[?7l\x1b[r");
         if old.is_none_or(|o| o.w != view.w || o.h != view.h) {
             self.last_rows.clear();
             self.last_status.clear();
-            self.last_widths.clear();
-            self.last_status_width = 0;
             frame.push_str("\x1b[2J");
         }
         if self.last_rows.len() != body_h {
             self.last_rows.resize(body_h, String::new());
         }
-        if self.last_widths.len() != body_h {
-            self.last_widths.resize(body_h, 0);
-        }
         for row in 0..body_h {
             let idx = self.top + row;
-            let (rendered, used) = self.render_row(idx, width);
+            let (rendered, _) = self.render_row(idx, width);
             if self.last_rows[row] != rendered {
-                frame.push_str(&format!("\x1b[{};1H{}", row + 1, rendered));
-                if self.last_widths[row] > used {
-                    frame.push_str("\x1b[K");
-                }
+                frame.push_str(&frame_row(row, &rendered));
                 self.last_rows[row] = rendered;
-                self.last_widths[row] = used;
             }
         }
 
-        let (status, status_width) = self.render_status(width, h);
+        let (status, _) = self.render_status(width, h);
         if self.last_status != status {
             frame.push_str(&status);
-            if self.last_status_width > status_width {
-                frame.push_str("\x1b[K");
-            }
             self.last_status = status;
-            self.last_status_width = status_width;
         }
         out.write_all(frame.as_bytes())?;
         out.flush()?;
@@ -276,19 +294,28 @@ impl App {
         if idx >= self.lines.len() {
             return (String::from("\x1b[0m"), 0);
         }
-        if self.left == 0 {
-            if let Some(raw) = self.raw_lines.as_ref().and_then(|r| r.get(idx)) {
-                // For already-colored command output, replay sanitized SGR bytes
-                // verbatim so Ghostty renders exactly as it would without bless.
-                let used = self.lines[idx]
-                    .iter()
-                    .map(|c| char_width(c.ch))
-                    .sum::<usize>()
-                    .min(width);
-                return (format!("\x1b[0m{}\x1b[0m", raw), used);
-            }
+        let is_search_hit = self.search.is_some() && self.matches.binary_search(&idx).is_ok();
+        let row_width = line_width(&self.lines[idx]);
+        if self.left == 0
+            && !is_search_hit
+            && row_width <= width
+            && let Some(raw) = self.raw_lines.as_ref().and_then(|r| r.get(idx))
+            && !raw.contains('\t')
+        {
+            return (format!("\x1b[0m{}\x1b[0m", raw), row_width);
         }
-        render_line(&self.lines[idx], self.left, width, self.search.as_deref())
+        let is_current_match = self.current_match_line() == Some(idx);
+        render_line(
+            &self.lines[idx],
+            self.left,
+            width,
+            self.search.as_deref(),
+            is_current_match,
+        )
+    }
+
+    fn current_match_line(&self) -> Option<usize> {
+        self.matches.get(self.match_idx).copied()
     }
 
     fn render_status(&self, width: usize, h: u16) -> (String, usize) {
@@ -300,15 +327,17 @@ impl App {
             self.top.min(total - 1) + 1
         };
         let last = (self.top + body_h).min(total);
-        let pct = if total == 0 {
-            100
-        } else {
-            (last * 100) / total
-        };
+        let pct = (last * 100).checked_div(total).unwrap_or(100);
         let search = self
             .search
             .as_ref()
-            .map(|s| format!(" /{s} [{}]", self.matches.len()))
+            .map(|s| {
+                if self.matches.is_empty() {
+                    format!(" /{s} [0]")
+                } else {
+                    format!(" /{s} [{}/{}]", self.match_idx + 1, self.matches.len())
+                }
+            })
             .unwrap_or_default();
         let notice = self
             .notice
@@ -321,14 +350,12 @@ impl App {
         );
         let text = fit_width(&format!(" {label} "), width);
         let used = display_width(&text).min(width);
-        // Floating transparent status: reset to Ghostty's default fg/bg, clear
-        // the row back to terminal background, then draw only the label with
-        // one column of horizontal padding.
         (format!("\x1b[{};1H\x1b[0m\x1b[2K{}\x1b[0m", h, text), used)
     }
 
     fn search_rev(&self) -> u64 {
         let mut h = self.matches.len() as u64;
+        h = h.wrapping_mul(16777619) ^ self.match_idx as u64;
         if let Some(s) = &self.search {
             for b in s.as_bytes() {
                 h = h.wrapping_mul(16777619) ^ *b as u64;
@@ -342,6 +369,86 @@ impl App {
     }
 }
 
+fn frame_row(row: usize, rendered: &str) -> String {
+    format!("\x1b[{};1H\x1b[2K{}", row + 1, rendered)
+}
+
 fn page_height() -> usize {
     Terminal::size().1.saturating_sub(1) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::{highlight_text, parse_ansi};
+
+    #[test]
+    fn changed_rows_are_cleared_before_redraw() {
+        assert_eq!(frame_row(2, "short"), "\x1b[3;1H\x1b[2Kshort");
+    }
+
+    #[test]
+    fn ansi_rows_use_styled_renderer_when_searching() -> Result<()> {
+        let (lines, raw) = parse_ansi("\x1b[32mneedle\x1b[0m")?;
+        let mut app = App::new(lines, Some(raw), "test".into(), None);
+        app.search = Some("needle".into());
+        app.rebuild_matches();
+
+        let (rendered, _) = app.render_row(0, 80);
+        assert!(rendered.contains("\x1b[0;97;41mneedle"), "{rendered:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn caches_width_and_sanitizes_status_metadata() {
+        let lines = highlight_text("x\nabcdef", None);
+        let app = App::new(
+            lines,
+            None,
+            "bad\x1b]52;name".into(),
+            Some("bell\x07".into()),
+        );
+        assert_eq!(app.max_line_width, 6);
+        let (status, _) = app.render_status(80, 24);
+        assert!(status.contains("bad␛]52;name"), "{status:?}");
+        assert!(status.contains("bell␇"), "{status:?}");
+        assert!(!status.contains("\x1b]52"), "{status:?}");
+    }
+
+    #[test]
+    fn long_and_tabbed_ansi_rows_use_clipped_renderer() -> Result<()> {
+        let (lines, raw) = parse_ansi("\x1b[31mabcdef\x1b[0m")?;
+        let app = App::new(lines, Some(raw), "test".into(), None);
+        let (rendered, used) = app.render_row(0, 4);
+        assert_eq!(used, 4);
+        assert!(rendered.contains("abcd"), "{rendered:?}");
+        assert!(!rendered.contains("abcdef"), "{rendered:?}");
+
+        let (lines, raw) = parse_ansi("a\tb")?;
+        let app = App::new(lines, Some(raw), "test".into(), None);
+        let (rendered, _) = app.render_row(0, 80);
+        assert!(!rendered.contains('\t'), "{rendered:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn directional_keys_cycle_search_results_and_wrap() {
+        let input = (0..100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = App::new(highlight_text(&input, None), None, "test".into(), None);
+        app.matches = vec![10, 50, 90];
+
+        assert!(app.cycle_match_for_direction(&Input::Down));
+        assert_eq!(app.match_idx, 1);
+        assert!(app.cycle_match_for_direction(&Input::Right));
+        assert_eq!(app.match_idx, 2);
+        assert!(app.cycle_match_for_direction(&Input::Down));
+        assert_eq!(app.match_idx, 0);
+        assert!(app.cycle_match_for_direction(&Input::Up));
+        assert_eq!(app.match_idx, 2);
+        assert!(app.cycle_match_for_direction(&Input::Left));
+        assert_eq!(app.match_idx, 1);
+    }
 }

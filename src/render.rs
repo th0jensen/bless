@@ -1,3 +1,5 @@
+use libghostty_vt::unicode::codepoint_width;
+
 use crate::text::{Line, Style, TermColor};
 
 pub(crate) fn render_line(
@@ -5,20 +7,15 @@ pub(crate) fn render_line(
     left: usize,
     width: usize,
     search: Option<&str>,
+    current_match: bool,
 ) -> (String, usize) {
-    let plain: String = line.iter().map(|c| c.ch).collect();
-    let hit = search.and_then(|q| {
-        plain
-            .to_lowercase()
-            .find(&q.to_lowercase())
-            .map(|start| (start, start + q.chars().count()))
-    });
+    let hit = search.and_then(|query| find_match(line, query));
     let mut rendered = String::new();
     let mut col = 0usize;
     let mut logical = 0usize;
     let mut current = Style::default();
     rendered.push_str("\x1b[0m");
-    for cell in line {
+    for (cell_idx, cell) in line.iter().enumerate() {
         let cw = char_width(cell.ch);
         if logical + cw <= left {
             logical += cw;
@@ -29,11 +26,16 @@ pub(crate) fn render_line(
         }
         let mut st = cell.style;
         if hit
-            .map(|(a, b)| logical >= a && logical < b)
+            .map(|(start, end)| cell_idx >= start && cell_idx < end)
             .unwrap_or(false)
         {
-            st.bg = Some(TermColor::Ansi(3));
-            st.fg = Some(TermColor::Ansi(0));
+            if current_match {
+                st.bg = Some(TermColor::Ansi(1));
+                st.fg = Some(TermColor::Ansi(15));
+            } else {
+                st.bg = Some(TermColor::Ansi(3));
+                st.fg = Some(TermColor::Ansi(0));
+            }
         }
         if st != current {
             rendered.push_str(&ansi_for(st));
@@ -47,7 +49,29 @@ pub(crate) fn render_line(
     (rendered, col)
 }
 
-fn ansi_for(s: Style) -> String {
+pub(crate) fn line_matches(line: &Line, query: &str) -> bool {
+    find_match(line, query).is_some()
+}
+
+fn find_match(line: &Line, query: &str) -> Option<(usize, usize)> {
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return None;
+    }
+
+    let mut haystack = Vec::new();
+    for (cell_idx, cell) in line.iter().enumerate() {
+        for folded in cell.ch.to_lowercase() {
+            haystack.push((folded, cell_idx));
+        }
+    }
+    let start = haystack
+        .windows(needle.len())
+        .position(|window| window.iter().map(|(ch, _)| *ch).eq(needle.iter().copied()))?;
+    Some((haystack[start].1, haystack[start + needle.len() - 1].1 + 1))
+}
+
+pub(crate) fn ansi_for(s: Style) -> String {
     let mut parts: Vec<String> = vec!["0".into()];
     if s.bold {
         parts.push("1".into());
@@ -72,8 +96,6 @@ fn ansi_for(s: Style) -> String {
 
 fn push_color(parts: &mut Vec<String>, base: u8, c: TermColor) {
     match c {
-        // Preserve named colors as named SGR so Ghostty applies the user's
-        // configured palette. Use 256-color SGR only for true palette indexes.
         TermColor::Ansi(n @ 0..=7) if base == 38 => parts.push((30 + n).to_string()),
         TermColor::Ansi(n @ 8..=15) if base == 38 => parts.push((90 + n - 8).to_string()),
         TermColor::Ansi(n @ 0..=7) if base == 48 => parts.push((40 + n).to_string()),
@@ -90,20 +112,7 @@ fn push_color(parts: &mut Vec<String>, base: u8, c: TermColor) {
 }
 
 pub(crate) fn char_width(c: char) -> usize {
-    match c {
-        '\u{0000}'..='\u{001f}' | '\u{007f}' => 0,
-        '\u{1100}'..='\u{115f}'
-        | '\u{2329}'
-        | '\u{232a}'
-        | '\u{2e80}'..='\u{a4cf}'
-        | '\u{ac00}'..='\u{d7a3}'
-        | '\u{f900}'..='\u{faff}'
-        | '\u{fe10}'..='\u{fe19}'
-        | '\u{fe30}'..='\u{fe6f}'
-        | '\u{ff00}'..='\u{ff60}'
-        | '\u{ffe0}'..='\u{ffe6}' => 2,
-        _ => 1,
-    }
+    codepoint_width(c) as usize
 }
 
 pub(crate) fn fit_width(s: &str, width: usize) -> String {
@@ -124,18 +133,35 @@ pub(crate) fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
+pub(crate) fn line_width(line: &Line) -> usize {
+    line.iter().map(|cell| char_width(cell.ch)).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::text::parse_ansi;
 
     #[test]
-    fn fastfetch_style_bright_named_color_survives() {
-        let (lines, _raw) = parse_ansi("\x1b]1337;File=inline=1:AAAA\x07\x1b[90mgray\x1b[m\n\x1b_Ga=T;AAAA\x1b\\\x1b[1m\x1b[32mgreen\x1b[m").unwrap();
+    fn fastfetch_style_bright_named_color_survives() -> anyhow::Result<()> {
+        let (lines, _raw) = parse_ansi(
+            "\x1b]1337;File=inline=1:AAAA\x07\x1b[90mgray\x1b[m\n\x1b_Ga=T;AAAA\x1b\\\x1b[1m\x1b[32mgreen\x1b[m",
+        )?;
         assert_eq!(lines.len(), 2);
-        let (rendered0, _) = render_line(&lines[0], 0, 80, None);
-        let (rendered1, _) = render_line(&lines[1], 0, 80, None);
+        let (rendered0, _) = render_line(&lines[0], 0, 80, None, false);
+        let (rendered1, _) = render_line(&lines[1], 0, 80, None, false);
         assert!(rendered0.contains(";90m"), "{rendered0:?}");
         assert!(rendered1.contains("\x1b[0;1;32m"), "{rendered1:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn unicode_search_uses_cell_indexes_not_utf8_offsets() {
+        let lines = crate::text::highlight_text("אבג café İST", None);
+        assert!(line_matches(&lines[0], "בג"));
+        assert!(line_matches(&lines[0], "CAFÉ"));
+        assert!(line_matches(&lines[0], "i̇st"));
+        let (rendered, _) = render_line(&lines[0], 0, 80, Some("café"), true);
+        assert!(rendered.contains("\x1b[0;97;41mcafé"), "{rendered:?}");
     }
 }
