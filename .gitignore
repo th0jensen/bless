@@ -1,3 +1,5 @@
 target/
 .DS_Store
 doc/
+.gitleaks.toml
+.pi-lens.json

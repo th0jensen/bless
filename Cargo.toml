@@ -2,6 +2,8 @@
 name = "bless"
 version = "0.1.0"
 edition = "2024"
+publish = false
+exclude = ["vendor/ghostty/**"]
 description = "A blessed less: Rust pager with libghostty-vt SGR parsing and syntax highlighting"
 license = "MIT"
 repository = "https://github.com/th0jensen/bless"
