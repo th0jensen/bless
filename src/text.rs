@@ -1,12 +1,15 @@
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use libghostty_vt::{
-    sgr::{Attribute, Parser as SgrParser},
-    style::Underline,
+    Error, RenderState, Terminal,
+    render::{CellIterator, RowIterator},
+    screen::{CellContentTag, CellWide, GridRef},
+    style::{Palette, RgbColor, StyleColor, Underline},
+    terminal::{Mode, Point, PointCoordinate, ScrollViewport},
 };
 
-use crate::{MAX_LINES, render::ansi_for};
+use crate::MAX_LINES;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TermColor {
@@ -18,618 +21,386 @@ pub(crate) enum TermColor {
 pub(crate) struct Style {
     pub(crate) fg: Option<TermColor>,
     pub(crate) bg: Option<TermColor>,
+    pub(crate) underline_color: Option<TermColor>,
     pub(crate) bold: bool,
+    pub(crate) faint: bool,
     pub(crate) italic: bool,
-    pub(crate) underline: bool,
+    pub(crate) underline: Option<Underline>,
+    pub(crate) blink: bool,
     pub(crate) reverse: bool,
+    pub(crate) invisible: bool,
+    pub(crate) strikethrough: bool,
+    pub(crate) overline: bool,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Cell {
     pub(crate) ch: char,
+    pub(crate) width: u8,
     pub(crate) style: Style,
+    pub(crate) hyperlink: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
 struct Span {
     text: String,
+    widths: Vec<u8>,
     style: Style,
+    hyperlink: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Line {
     spans: Vec<Span>,
+    width: usize,
 }
 
 impl Line {
-    pub(crate) fn push(&mut self, cell: Cell) {
+    fn push(&mut self, cell: Cell) {
+        self.width += cell.width as usize;
         if let Some(last) = self.spans.last_mut()
             && last.style == cell.style
+            && last.hyperlink == cell.hyperlink
         {
             last.text.push(cell.ch);
+            last.widths.push(cell.width);
             return;
         }
         self.spans.push(Span {
             text: cell.ch.to_string(),
+            widths: vec![cell.width],
             style: cell.style,
+            hyperlink: cell.hyperlink,
         });
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = Cell> + '_ {
         self.spans.iter().flat_map(|span| {
-            span.text.chars().map(|ch| Cell {
-                ch,
-                style: span.style,
-            })
+            span.text
+                .chars()
+                .zip(&span.widths)
+                .map(|(ch, &width)| Cell {
+                    ch,
+                    width,
+                    style: span.style,
+                    hyperlink: span.hyperlink.clone(),
+                })
         })
+    }
+
+    pub(crate) fn width(&self) -> usize {
+        self.width
     }
 }
 
 pub(crate) fn sanitize_terminal_text(input: &str) -> String {
-    input.chars().map(visible_control).collect()
-}
-
-fn visible_control(ch: char) -> char {
-    match ch {
-        '\0'..='\u{1f}' => char::from_u32(0x2400 + ch as u32).unwrap_or('\u{fffd}'),
-        '\u{7f}' => '\u{2421}',
-        c if c.is_control() => '\u{fffd}',
-        c => c,
-    }
-}
-
-fn apply_sgr(sgr: &mut SgrParser<'_>, params: &[u16], seps: &[u8], style: &mut Style) {
-    let params = if params.is_empty() {
-        &[0u16][..]
-    } else {
-        params
-    };
-    let seps = (!seps.is_empty()).then_some(seps);
-    if sgr.set_params(params, seps).is_err() {
-        return;
-    }
-    while let Ok(Some(attr)) = sgr.next() {
-        apply_attr(attr, style);
-    }
-    apply_basic_sgr(params, style);
-}
-
-fn apply_basic_sgr(params: &[u16], s: &mut Style) {
-    let mut i = 0;
-    while i < params.len() {
-        match params[i] {
-            0 => *s = Style::default(),
-            1 => s.bold = true,
-            3 => s.italic = true,
-            4 => s.underline = true,
-            7 => s.reverse = true,
-            22 => s.bold = false,
-            23 => s.italic = false,
-            24 => s.underline = false,
-            27 => s.reverse = false,
-            30..=37 => s.fg = Some(TermColor::Ansi((params[i] - 30) as u8)),
-            40..=47 => s.bg = Some(TermColor::Ansi((params[i] - 40) as u8)),
-            90..=97 => s.fg = Some(TermColor::Ansi((params[i] - 90 + 8) as u8)),
-            100..=107 => s.bg = Some(TermColor::Ansi((params[i] - 100 + 8) as u8)),
-            39 => s.fg = None,
-            49 => s.bg = None,
-            38 | 48 if i + 2 < params.len() && params[i + 1] == 5 => {
-                let color = TermColor::Ansi(params[i + 2].min(255) as u8);
-                if params[i] == 38 {
-                    s.fg = Some(color);
-                } else {
-                    s.bg = Some(color);
-                }
-                i += 2;
-            }
-            38 | 48 if i + 4 < params.len() && params[i + 1] == 2 => {
-                let color = TermColor::Rgb(
-                    params[i + 2].min(255) as u8,
-                    params[i + 3].min(255) as u8,
-                    params[i + 4].min(255) as u8,
-                );
-                if params[i] == 38 {
-                    s.fg = Some(color);
-                } else {
-                    s.bg = Some(color);
-                }
-                i += 4;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-}
-
-fn apply_attr(attr: Attribute<'_>, s: &mut Style) {
-    match attr {
-        Attribute::Unset => *s = Style::default(),
-        Attribute::Bold => s.bold = true,
-        Attribute::ResetBold => s.bold = false,
-        Attribute::Italic => s.italic = true,
-        Attribute::ResetItalic => s.italic = false,
-        Attribute::Underline(underline) => s.underline = underline != Underline::None,
-        Attribute::Inverse => s.reverse = true,
-        Attribute::ResetInverse => s.reverse = false,
-        Attribute::DirectColorFg(c) => s.fg = Some(TermColor::Rgb(c.r, c.g, c.b)),
-        Attribute::DirectColorBg(c) => s.bg = Some(TermColor::Rgb(c.r, c.g, c.b)),
-        Attribute::Fg8(c) => s.fg = Some(TermColor::Ansi(c.0)),
-        Attribute::Bg8(c) => s.bg = Some(TermColor::Ansi(c.0)),
-        Attribute::BrightFg8(c) => s.fg = Some(TermColor::Ansi(c.0)),
-        Attribute::BrightBg8(c) => s.bg = Some(TermColor::Ansi(c.0)),
-        Attribute::Fg256(c) => s.fg = Some(TermColor::Ansi(c.0)),
-        Attribute::Bg256(c) => s.bg = Some(TermColor::Ansi(c.0)),
-        Attribute::ResetFg => s.fg = None,
-        Attribute::ResetBg => s.bg = None,
-        _ => {}
-    }
-}
-
-pub(crate) fn parse_ansi(input: &str) -> Result<(Vec<Line>, Vec<String>)> {
-    let mut out = Vec::new();
-    let mut raw_out = Vec::new();
-    let mut cur: Vec<Cell> = Vec::new();
-    let mut col = 0usize;
-    let mut raw_cur = String::new();
-    let mut style = Style::default();
-    let mut sgr = SgrParser::new()?;
-    let mut it = input.chars().peekable();
-    while let Some(ch) = it.next() {
-        match ch {
-            '\n' => {
-                if out.len() >= MAX_LINES {
-                    break;
-                }
-                finish_line(&mut out, &mut raw_out, &mut cur, &mut raw_cur, &mut col);
-            }
-            '\r' if it.peek() != Some(&'\n') => {
-                cur.clear();
-                col = 0;
-                raw_cur.clear();
-                if style != Style::default() {
-                    raw_cur.push_str(&ansi_for(style));
-                }
-            }
-            '\x08' => {
-                col = col.saturating_sub(1);
-                raw_cur.push('\x08');
-            }
-            '\t' => {
-                raw_cur.push('\t');
-                for _ in 0..4 {
-                    overwrite_cell(&mut cur, &mut col, Cell { ch: ' ', style });
-                }
-            }
-            '\x1b' => match it.next() {
-                Some('[') => {
-                    let mut raw = String::new();
-                    for c in it.by_ref() {
-                        if c.is_ascii_alphabetic() || matches!(c, '@' | '`' | '~') {
-                            if c == 'm' {
-                                let (p, seps) = parse_sgr_params(&raw);
-                                apply_sgr(&mut sgr, &p, &seps, &mut style);
-                                raw_cur.push_str("\x1b[");
-                                raw_cur.push_str(&raw);
-                                raw_cur.push('m');
-                            }
-                            break;
-                        }
-                        raw.push(c);
-                    }
-                }
-                Some(']') => {
-                    if let Some(seq) = capture_osc_hyperlink(&mut it) {
-                        raw_cur.push_str(&seq);
-                    }
-                }
-                Some('P' | '_' | '^' | 'X' | 'G') => skip_until_st(&mut it),
-                Some('(' | ')' | '*' | '+' | '-' | '.' | '/') => {
-                    it.next();
-                }
-                _ => {}
-            },
-            c if !c.is_control() => {
-                raw_cur.push(c);
-                overwrite_cell(&mut cur, &mut col, Cell { ch: c, style });
-            }
-            _ => {}
-        }
-    }
-    if !input.ends_with('\n') {
-        finish_line(&mut out, &mut raw_out, &mut cur, &mut raw_cur, &mut col);
-    }
-    Ok((out, raw_out))
-}
-
-fn overwrite_cell(cur: &mut Vec<Cell>, col: &mut usize, cell: Cell) {
-    match cur.get_mut(*col) {
-        Some(existing) if existing.ch == cell.ch => existing.style.bold = true,
-        Some(existing) if existing.ch == '_' && cell.ch != '_' => {
-            *existing = Cell {
-                ch: cell.ch,
-                style: Style {
-                    underline: true,
-                    ..cell.style
-                },
-            };
-        }
-        Some(existing) => *existing = cell,
-        None => cur.push(cell),
-    }
-    *col += 1;
-}
-
-fn finish_line(
-    out: &mut Vec<Line>,
-    raw_out: &mut Vec<String>,
-    cur: &mut Vec<Cell>,
-    raw_cur: &mut String,
-    col: &mut usize,
-) {
-    let mut line = Line::default();
-    for cell in cur.drain(..) {
-        line.push(cell);
-    }
-    out.push(line);
-    raw_out.push(std::mem::take(raw_cur));
-    *col = 0;
-}
-
-fn skip_until_st<I: Iterator<Item = char>>(it: &mut std::iter::Peekable<I>) {
-    while let Some(c) = it.next() {
-        if c == '\x1b' && it.peek() == Some(&'\\') {
-            it.next();
-            break;
-        }
-    }
-}
-
-fn capture_osc_hyperlink<I: Iterator<Item = char>>(
-    it: &mut std::iter::Peekable<I>,
-) -> Option<String> {
-    let mut body = String::new();
-    let mut terminator = String::new();
-    while let Some(c) = it.next() {
-        if c == '\x07' {
-            terminator.push(c);
-            break;
-        }
-        if c == '\x1b' && it.peek() == Some(&'\\') {
-            it.next();
-            terminator.push_str("\x1b\\");
-            break;
-        }
-        body.push(c);
-    }
-    (!terminator.is_empty() && body.starts_with("8;")).then(|| format!("\x1b]{body}{terminator}"))
-}
-
-fn parse_sgr_params(raw: &str) -> (Vec<u16>, Vec<u8>) {
-    let mut nums = Vec::new();
-    let mut seps = Vec::new();
-    let mut cur = String::new();
-    for c in raw
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == ';' || *c == ':')
-    {
-        if c == ';' || c == ':' {
-            nums.push(cur.parse().unwrap_or(0));
-            seps.push(c as u8);
-            cur.clear();
-        } else {
-            cur.push(c);
-        }
-    }
-    if !cur.is_empty() || raw.ends_with(';') || raw.ends_with(':') {
-        nums.push(cur.parse().unwrap_or(0));
-        seps.push(b';');
-    }
-    (nums, seps)
-}
-
-pub(crate) fn highlight_text(input: &str, path: Option<&PathBuf>) -> Vec<Line> {
-    let lang = path
-        .and_then(|p| p.extension())
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
     input
-        .lines()
-        .take(MAX_LINES)
-        .map(|line| highlight_line_simple(line, lang))
+        .chars()
+        .map(|ch| match ch {
+            '\0'..='\u{1f}' => char::from_u32(0x2400 + ch as u32).unwrap_or('\u{fffd}'),
+            '\u{7f}' => '\u{2421}',
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
         .collect()
 }
 
-fn highlight_line_simple(line: &str, lang: &str) -> Line {
-    let plain = Style::default();
-    let comment = Style {
-        fg: Some(TermColor::Ansi(8)),
-        italic: true,
-        ..Style::default()
-    };
-    let string = Style {
-        fg: Some(TermColor::Ansi(10)),
-        ..Style::default()
-    };
-    let number = Style {
-        fg: Some(TermColor::Ansi(11)),
-        ..Style::default()
-    };
-    let keyword = Style {
-        fg: Some(TermColor::Ansi(13)),
-        bold: true,
-        ..Style::default()
-    };
-    let punctuation = Style {
-        fg: Some(TermColor::Ansi(12)),
-        ..Style::default()
-    };
+/// Decode the original bytes once, then join soft wraps for horizontal paging.
+/// Geometry affects VT cursor addressing, but never the stored row wrapping.
+pub(crate) fn parse_vt(input: &[u8], cols: u16, rows: u16) -> Result<Vec<Line>> {
+    let mut terminal = vt_terminal(cols, rows)?;
+    terminal.vt_write(input);
+    snapshot_lines(&mut terminal)
+}
 
-    let comment_marker = match lang {
-        "rs" | "c" | "h" | "cpp" | "hpp" | "js" | "ts" | "go" | "java" | "zig" => Some("//"),
-        "sh" | "bash" | "zsh" | "fish" | "toml" | "yaml" | "yml" | "py" => Some("#"),
-        _ => None,
+pub(crate) fn vt_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
+    let mut terminal = Terminal::new(cols.max(1), rows.max(1))?;
+    terminal
+        .set_default_mode(Mode::LINEFEED, true)?
+        .set_default_mode(Mode::GRAPHEME_CLUSTER, true)?
+        .set_scrollback_max_bytes(Some(usize::MAX))?
+        .set_scrollback_max_lines(None)?;
+    // Host title, clipboard, and other effects remain unregistered. Command
+    // capture may route query replies to its child PTY, never to the host.
+    Ok(terminal)
+}
+
+pub(crate) fn snapshot_lines(terminal: &mut Terminal<'_, '_>) -> Result<Vec<Line>> {
+    let total = terminal.total_rows()?;
+    let history = terminal.scrollback_rows()?;
+    let cursor_end = history
+        + terminal.cursor_y()? as usize
+        + usize::from(terminal.cursor_x()? > 0 || terminal.is_cursor_pending_wrap()?);
+    let colors = Colors {
+        fg: terminal.fg_color()?,
+        bg: terminal.bg_color()?,
+        palette: terminal.color_palette()?,
+        defaults: terminal.default_color_palette()?,
+        reverse: terminal.mode(Mode::REVERSE_COLORS)?,
     };
-
-    let mut cells = Line::default();
-    let mut chars = line.char_indices().peekable();
-    let mut in_string: Option<char> = None;
-
-    while let Some((_, ch)) = chars.next() {
-        if let Some(q) = in_string {
-            push_cell(&mut cells, ch, string);
-            if ch == '\\' {
-                if let Some((_, escaped)) = chars.next() {
-                    push_cell(&mut cells, escaped, string);
+    let mut render = RenderState::new()?;
+    let mut row_iter = RowIterator::new()?;
+    let mut cell_iter = CellIterator::new()?;
+    let mut text = String::new();
+    let mut uri = Vec::new();
+    let mut out = Vec::new();
+    let mut current = Line::default();
+    let mut extent = 0;
+    let mut processed = 0;
+    let mut previous_offset = 0;
+    terminal.scroll_viewport(ScrollViewport::Top);
+    while processed < total && out.len() < MAX_LINES {
+        // The last window clamps to the active area. Skip overlapping rows.
+        let offset = processed.min(history);
+        terminal.scroll_viewport(ScrollViewport::Delta((offset - previous_offset) as isize));
+        previous_offset = offset;
+        let snapshot = render.update(terminal)?;
+        let mut row = row_iter.update(&snapshot)?;
+        while let Some(row) = row.next() {
+            let y = row.viewport_y()? as usize;
+            let index = offset + y;
+            if index < processed {
+                continue;
+            }
+            let wrapped = row.raw_row()?.is_wrapped()?;
+            let mut cells = cell_iter.update(row)?;
+            let mut pending_blanks = Vec::new();
+            let mut x = 0;
+            while let Some(cell) = cells.next() {
+                let raw = cell.raw_cell()?;
+                let column = x;
+                x += 1;
+                let wide = raw.wide()?;
+                if matches!(wide, CellWide::SpacerHead | CellWide::SpacerTail) {
+                    continue;
                 }
-            } else if ch == q {
-                in_string = None;
-            }
-            continue;
-        }
-
-        let starts_comment = match comment_marker {
-            Some("#") => ch == '#',
-            Some("//") => ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/'),
-            _ => false,
-        };
-        if starts_comment {
-            push_cell(&mut cells, ch, comment);
-            if comment_marker == Some("//")
-                && let Some((_, slash)) = chars.next()
-            {
-                push_cell(&mut cells, slash, comment);
-            }
-            for (_, rest) in chars {
-                push_cell(&mut cells, rest, comment);
-            }
-            break;
-        }
-
-        if ch == '"' || ch == '\'' || ch == '`' {
-            in_string = Some(ch);
-            push_cell(&mut cells, ch, string);
-        } else if ch.is_ascii_digit() {
-            push_cell(&mut cells, ch, number);
-        } else if is_ident_start(ch) {
-            let mut word = String::from(ch);
-            while let Some((_, next)) = chars.peek().copied() {
-                if is_ident_continue(next) {
-                    word.push(next);
-                    chars.next();
+                let mut style = cell.style()?;
+                style.bg_color = match raw.content_tag()? {
+                    CellContentTag::BgColorPalette => StyleColor::Palette(raw.bg_color_palette()?),
+                    CellContentTag::BgColorRgb => StyleColor::Rgb(raw.bg_color_rgb()?),
+                    _ => style.bg_color,
+                };
+                let style = colors.style(style);
+                let hyperlink = if raw.has_hyperlink()? {
+                    let grid = terminal.grid_ref(Point::Viewport(PointCoordinate {
+                        x: column,
+                        y: y as u32,
+                    }))?;
+                    read_hyperlink(&grid, &mut uri)?
                 } else {
+                    None
+                };
+                cell.graphemes_utf8(&mut text)?;
+                let width = if wide == CellWide::Wide { 2 } else { 1 };
+                if text.is_empty() {
+                    let blank = Cell {
+                        ch: ' ',
+                        width,
+                        style,
+                        hyperlink,
+                    };
+                    if !wrapped && style == Style::default() && blank.hyperlink.is_none() {
+                        pending_blanks.push(blank);
+                        continue;
+                    }
+                    for blank in pending_blanks.drain(..) {
+                        current.push(blank);
+                    }
+                    current.push(blank);
+                } else {
+                    for blank in pending_blanks.drain(..) {
+                        current.push(blank);
+                    }
+                    for (i, ch) in text.chars().enumerate() {
+                        current.push(Cell {
+                            ch,
+                            width: if i == 0 { width } else { 0 },
+                            style,
+                            hyperlink: hyperlink.clone(),
+                        });
+                    }
+                }
+            }
+            processed = index + 1;
+            if !wrapped {
+                let meaningful = current.width() > 0 || processed <= cursor_end;
+                out.push(std::mem::take(&mut current));
+                if meaningful {
+                    extent = out.len();
+                }
+                if out.len() >= MAX_LINES {
                     break;
                 }
             }
-            let st = if is_keyword(&word, lang) {
-                keyword
-            } else {
-                plain
-            };
-            for c in word.chars() {
-                push_cell(&mut cells, c, st);
+        }
+    }
+    out.truncate(extent);
+    Ok(out)
+}
+
+fn read_hyperlink(grid: &GridRef<'_>, buf: &mut Vec<u8>) -> Result<Option<Arc<str>>> {
+    let len = match grid.hyperlink_uri(buf) {
+        Err(Error::OutOfSpace { required }) => {
+            buf.resize(required, 0);
+            grid.hyperlink_uri(buf)?
+        }
+        result => result?,
+    };
+    let uri = std::str::from_utf8(&buf[..len])?;
+    Ok((!uri.is_empty() && !uri.chars().any(char::is_control)).then(|| Arc::from(uri)))
+}
+
+struct Colors {
+    fg: Option<RgbColor>,
+    bg: Option<RgbColor>,
+    palette: Palette,
+    defaults: Palette,
+    reverse: bool,
+}
+
+impl Colors {
+    fn color(&self, color: StyleColor, default: Option<RgbColor>) -> Option<TermColor> {
+        match color {
+            StyleColor::None => default.map(|c| TermColor::Rgb(c.r, c.g, c.b)),
+            StyleColor::Rgb(c) => Some(TermColor::Rgb(c.r, c.g, c.b)),
+            StyleColor::Palette(index) => {
+                let c = self.palette.get(index);
+                Some(if c == self.defaults.get(index) {
+                    TermColor::Ansi(index.0)
+                } else {
+                    TermColor::Rgb(c.r, c.g, c.b)
+                })
             }
-        } else if "{}[]()<>:=+-*/%!|&.,;".contains(ch) {
-            push_cell(&mut cells, ch, punctuation);
-        } else {
-            push_cell(&mut cells, ch, plain);
         }
     }
-    cells
-}
 
-fn push_cell(cells: &mut Line, ch: char, style: Style) {
-    if ch == '\t' {
-        for _ in 0..4 {
-            cells.push(Cell { ch: ' ', style });
+    fn style(&self, s: libghostty_vt::style::Style) -> Style {
+        Style {
+            fg: self.color(s.fg_color, self.fg),
+            bg: self.color(s.bg_color, self.bg),
+            underline_color: self.color(s.underline_color, None),
+            bold: s.bold,
+            faint: s.faint,
+            italic: s.italic,
+            underline: (s.underline != Underline::None).then_some(s.underline),
+            blink: s.blink,
+            reverse: s.inverse ^ self.reverse,
+            invisible: s.invisible,
+            strikethrough: s.strikethrough,
+            overline: s.overline,
         }
-    } else {
-        cells.push(Cell {
-            ch: visible_control(ch),
-            style,
-        });
-    }
-}
-
-fn is_ident_start(c: char) -> bool {
-    c == '_' || c.is_ascii_alphabetic()
-}
-
-fn is_ident_continue(c: char) -> bool {
-    c == '_' || c.is_ascii_alphanumeric()
-}
-
-fn is_keyword(word: &str, lang: &str) -> bool {
-    match lang {
-        "rs" => matches!(
-            word,
-            "as" | "async"
-                | "await"
-                | "break"
-                | "const"
-                | "continue"
-                | "crate"
-                | "dyn"
-                | "else"
-                | "enum"
-                | "extern"
-                | "false"
-                | "fn"
-                | "for"
-                | "if"
-                | "impl"
-                | "in"
-                | "let"
-                | "loop"
-                | "match"
-                | "mod"
-                | "move"
-                | "mut"
-                | "pub"
-                | "ref"
-                | "return"
-                | "self"
-                | "Self"
-                | "static"
-                | "struct"
-                | "super"
-                | "trait"
-                | "true"
-                | "type"
-                | "unsafe"
-                | "use"
-                | "where"
-                | "while"
-        ),
-        "sh" | "bash" | "zsh" | "fish" => matches!(
-            word,
-            "if" | "then"
-                | "else"
-                | "elif"
-                | "fi"
-                | "for"
-                | "while"
-                | "do"
-                | "done"
-                | "case"
-                | "esac"
-                | "function"
-                | "return"
-                | "export"
-                | "local"
-                | "set"
-        ),
-        "toml" | "yaml" | "yml" | "json" => matches!(word, "true" | "false" | "null"),
-        _ => false,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use anyhow::Context;
+pub(crate) fn parse_ansi(input: &str) -> Result<Vec<Line>> {
+    parse_vt(input.as_bytes(), 80, 24)
+}
 
+#[cfg(test)]
+mod tests {
     use super::*;
 
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.iter().map(|cell| cell.ch).collect())
+            .collect()
+    }
+
     #[test]
-    fn bare_carriage_return_collapses_progress_output() -> Result<()> {
-        let input = "\x1b[32mLoading\x1b[0m\r\x1b[32mLoading..\x1b[0m\r\x1b[32mDone!\x1b[0m\n";
-        let (lines, raw) = parse_ansi(input)?;
-        assert_eq!(lines.len(), 1);
-        let text: String = lines[0].iter().map(|c| c.ch).collect();
-        assert_eq!(text, "Done!");
-        assert!(raw[0].contains("Done!"), "{:?}", raw[0]);
-        assert!(!raw[0].contains("Loading"), "{:?}", raw[0]);
+    fn controls_are_interpreted_even_without_escape_bytes() -> Result<()> {
+        for (input, expected) in [
+            ("let count = 42;", "let count = 42;"),
+            ("abcdef\rxy", "xycdef"),
+            ("A\x08A", "A"),
+            ("_\x08X", "X"),
+            ("e\u{301}\x08X", "X"),
+            ("a\tb\t界\tZ", "a       b       界      Z"),
+            ("\x1b(0lqk\x1b(B", "┌─┐"),
+            ("abc\x1b[2DX", "aXc"),
+            ("abcdef\x08\x08\x1b[KX", "abcdX"),
+        ] {
+            let lines = parse_ansi(input)?;
+            assert_eq!(plain(&lines), [expected], "{input:?}");
+            assert!(lines[0].iter().all(|cell| cell.style == Style::default()));
+        }
+        assert_eq!(plain(&parse_ansi("one\ntwo\x1b[A\rX")?), ["Xne", "two"]);
         Ok(())
     }
 
     #[test]
-    fn crlf_is_a_plain_newline_not_an_overwrite() -> Result<()> {
-        let input = "first line\r\nsecond line\r\n";
-        let (lines, _raw) = parse_ansi(input)?;
-        assert_eq!(lines.len(), 2);
-        assert_eq!(
-            lines[0].iter().map(|c| c.ch).collect::<String>(),
-            "first line"
-        );
-        assert_eq!(
-            lines[1].iter().map(|c| c.ch).collect::<String>(),
-            "second line"
-        );
+    fn line_endings_and_blank_lines_survive_without_screen_padding() -> Result<()> {
+        for (input, expected) in [
+            ("", vec![]),
+            ("\n", vec![""]),
+            ("one\n\n", vec!["one", ""]),
+            ("one\r\ntwo\r\n", vec!["one", "two"]),
+            ("discard\x1bcfirst\nsecond", vec!["first", "second"]),
+            ("\x1b]8;;https://example.com", vec![]),
+        ] {
+            assert_eq!(plain(&parse_ansi(input)?), expected, "{input:?}");
+        }
         Ok(())
     }
 
     #[test]
-    fn osc8_hyperlink_is_preserved_but_other_osc_is_stripped() -> Result<()> {
-        let input =
-            "\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\\n\x1b]0;window title\x07plain\n";
-        let (_lines, raw) = parse_ansi(input)?;
-        assert!(
-            raw[0].contains("\x1b]8;;https://example.com\x1b\\"),
-            "{:?}",
-            raw[0]
-        );
-        assert!(raw[0].contains("click"), "{:?}", raw[0]);
-        assert!(raw[0].contains("\x1b]8;;\x1b\\"), "{:?}", raw[0]);
-        assert!(!raw[1].contains("window title"), "{:?}", raw[1]);
-        assert!(raw[1].contains("plain"), "{:?}", raw[1]);
-        Ok(())
-    }
-
-    #[test]
-    fn unterminated_osc8_is_never_replayed() -> Result<()> {
-        let (_lines, raw) = parse_ansi("\x1b]8;;https://example.com")?;
-        assert_eq!(raw, vec![String::new()]);
-        Ok(())
-    }
-
-    #[test]
-    fn backspace_overstrike_bold_collapses_doubled_characters() -> Result<()> {
-        let (lines, raw) = parse_ansi("N\x08NA\x08AM\x08ME\x08E\n")?;
-        assert_eq!(lines.len(), 1);
-        let cells: Vec<Cell> = lines[0].iter().collect();
-        let text: String = cells.iter().map(|c| c.ch).collect();
-        assert_eq!(text, "NAME");
-        assert!(cells.iter().all(|c| c.style.bold), "{cells:?}");
-        assert!(raw[0].contains('\x08'), "{:?}", raw[0]);
-        Ok(())
-    }
-
-    #[test]
-    fn backspace_overstrike_underline_keeps_the_real_character() -> Result<()> {
-        let (lines, _raw) = parse_ansi("_\x08X\n")?;
-        let cells: Vec<Cell> = lines[0].iter().collect();
-        assert_eq!(cells.len(), 1);
-        assert_eq!(cells[0].ch, 'X');
-        assert!(cells[0].style.underline, "{cells:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn comment_markers_inside_strings_stay_string_colored() -> Result<()> {
-        let line = highlight_line_simple(r#"let url = "https://example"; // comment"#, "rs");
-        let cells: Vec<Cell> = line.iter().collect();
-        let text: String = cells.iter().map(|cell| cell.ch).collect();
-        let url_idx = text.find("https").context("URL in highlighted test line")?;
-        let comment_idx = text
-            .find("// comment")
-            .context("comment in highlighted test line")?;
-        assert_eq!(cells[url_idx].style.fg, Some(TermColor::Ansi(10)));
-        assert_eq!(cells[comment_idx].style.fg, Some(TermColor::Ansi(8)));
-        assert!(cells[comment_idx].style.italic);
-        Ok(())
-    }
-
-    #[test]
-    fn plain_text_is_compressed_into_one_style_run() {
-        let lines = highlight_text(&"a".repeat(100_000), None);
+    fn soft_wraps_and_scrollback_become_unwrapped_pageable_lines() -> Result<()> {
+        let long = "a".repeat(100_000);
+        let lines = parse_ansi(&long)?;
+        assert_eq!(plain(&lines), [long]);
+        assert_eq!(lines[0].width(), 100_000);
         assert_eq!(lines[0].spans.len(), 1);
-        assert_eq!(lines[0].spans[0].text.len(), 100_000);
+        let input = (0..500).map(|i| format!("row {i}\n")).collect::<String>();
+        let lines = parse_vt(input.as_bytes(), 16, 3)?;
+        assert_eq!(lines.len(), 500);
+        assert_eq!(plain(&lines)[0], "row 0");
+        assert_eq!(plain(&lines)[499], "row 499");
+        Ok(())
     }
 
     #[test]
-    fn plain_controls_and_status_text_are_made_visible() {
-        let lines = highlight_text("a\x07b\rc", None);
-        let text: String = lines[0].iter().map(|cell| cell.ch).collect();
-        assert_eq!(text, "a␇b␍c");
+    fn wide_graphemes_keep_the_emulators_column_widths() -> Result<()> {
+        let lines = parse_vt("abc界e\u{301}Z".as_bytes(), 4, 2)?;
+        assert_eq!(plain(&lines), ["abc界e\u{301}Z"]);
+        assert_eq!(lines[0].width(), 7);
+        let emoji = parse_ansi("👩\u{200d}💻X")?;
+        assert_eq!(plain(&emoji), ["👩\u{200d}💻X"]);
+        assert_eq!(emoji[0].width(), 3);
+        assert_eq!(plain(&parse_ansi("界A\x08\x08Z")?), [" ZA"]);
+        Ok(())
+    }
+
+    #[test]
+    fn osc_colors_and_erased_backgrounds_are_not_discarded() -> Result<()> {
+        let lines = parse_ansi("\x1b]4;1;rgb:11/82/e7\x1b\\\x1b[31mX\n\x1b[48;5;25m\x1b[K")?;
+        assert_eq!(
+            lines[0].iter().next().unwrap().style.fg,
+            Some(TermColor::Rgb(17, 130, 231))
+        );
+        assert_eq!(lines[1].width(), 80);
+        assert!(
+            lines[1]
+                .iter()
+                .all(|cell| cell.ch == ' ' && cell.style.bg == Some(TermColor::Ansi(25)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hyperlinks_survive_but_terminal_effects_are_not_replayed() -> Result<()> {
+        let lines = parse_ansi(
+            "\x1b]0;title\x07\x1b]52;c;AAAA\x07\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\plain",
+        )?;
+        assert_eq!(plain(&lines), ["clickplain"]);
+        assert!(
+            lines[0]
+                .iter()
+                .take(5)
+                .all(|cell| cell.hyperlink.as_deref() == Some("https://example.com"))
+        );
+        assert!(lines[0].iter().skip(5).all(|cell| cell.hyperlink.is_none()));
         assert_eq!(sanitize_terminal_text("x\x1b]52;y\n"), "x␛]52;y␊");
+        Ok(())
     }
 }

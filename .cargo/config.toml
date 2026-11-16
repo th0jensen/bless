@@ -1,3 +1,3 @@
 [env]
-# Build libghostty-vt from the shallow Ghostty submodule for Zig 0.16 compatibility.
+# Match the Ghostty revision pinned by libghostty-vt-sys (Zig 0.17).
 GHOSTTY_SOURCE_DIR = { value = "vendor/ghostty", relative = true }

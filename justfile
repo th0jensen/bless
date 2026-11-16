@@ -58,18 +58,71 @@ man:
     ${command_name} \- command shorthand for bless, a small Ghostty-oriented pager
     .SH SYNOPSIS
     .B ${command_name}
-    .RI [ OPTION ]...
-    .I FILE
+    .I COMMAND
+    .RI [ ARG ]...
+    .br
+    .B ${command_name}
+    .I 'SHELL COMMAND'
     .br
     .I COMMAND
-    .B | ${command_name} -
+    .B | ${command_name}
     .SH DESCRIPTION
     .B bless
     is a terminal pager inspired by
     .BR less (1).
     It renders directly to a modern Ghostty-compatible terminal and uses
     .B libghostty-vt
-    for SGR parsing so coloured command output can be preserved.
+    to interpret all input as ANSI/VT terminal output, without raw/color flags
+    or synthetic syntax highlighting. Cursor motion, erasure, character sets,
+    colours, decorations, and hyperlinks are decoded into pageable text cells.
+    .PP
+    Long rows are clipped, never wrapped. Horizontal scrolling preserves
+    text styling and OSC 8 hyperlinks. Tabs use eight-column terminal stops.
+    The status line shows the visible columns and the widest row.
+    Configure the producing command for wide, unwrapped output if it wraps
+    or truncates its own output before writing to the pipe.
+    The emulator uses the initial terminal dimensions and joins soft wraps
+    for horizontal paging. Resizing the pager does not replay the input.
+    Cursor-addressed output depends on that initial geometry.
+    .PP
+    Prefix a command with the pager, without a separator, to capture its normal
+    terminal output through a PTY:
+    .B ${command_name} git diff
+    .PP
+    Everything after the pager is executed, never treated as a file or pager
+    option. Multiple arguments run directly, preserving literal arguments.
+    A single argument is evaluated with -c by the spawning process's executable.
+    There is no shell-name allowlist and wrappers are not skipped: the caller
+    is responsible for supplying a shell-compatible executable. If the parent
+    executable cannot be read, the fallback is nonempty SHELL, then /bin/sh.
+    The selected path is exported
+    as SHELL to the child. Other exported variables and the working directory
+    are inherited, apart from the PTY and pager settings described below.
+    Quote a whole pipeline, redirection, or command list as one argument to put
+    it inside capture. Unquoted shell operators belong to the calling shell
+    and cannot be captured by the executable. The fresh noninteractive shell
+    does not copy the calling session's unexported variables, aliases, functions,
+    options, or jobs. The shell's own startup and exported-function rules apply.
+    Intermediate pipeline commands write to pipes and may suppress colours.
+    .PP
+    PowerShell aliases and cmdlets such as gci work without quoting. When a
+    command with arguments is not a native executable, PowerShell 7.5 or later
+    resolves it using -CommandWithArgs. Native executables retain exact argv.
+    Quote the whole command for colon-attached parameter values or explicit
+    switch booleans, which -CommandWithArgs otherwise converts.
+    .PP
+    The PTY is at least 160 columns wide, or the current viewport width if larger.
+    BLESS_COLUMNS overrides its width. Ghostty decodes output incrementally and
+    answers terminal queries back to the child. Both stdout and stderr are captured.
+    Capture finishes before paging; interactive prompts and live TUIs are not
+    supported. Piped stdin is passed to the child; host keyboard input is not.
+    Ctrl-C cancels capture and stops the child process group. Reaching the output
+    cap also stops the command. The command's exit status is returned after paging.
+    PAGER and GIT_PAGER are set to cat to prevent nested pagers.
+    .PP
+    The view is the final active text screen and retained scrollback, not an
+    animation. Graphics, clipboard writes, title changes, and terminal queries
+    are not forwarded to the host terminal.
     .PP
     The installed command is
     .B ${command_name}
@@ -79,19 +132,16 @@ man:
     .BR bless .
     .PP
     .B bless
-    does not read standard input implicitly when no file is given. Use
-    .B -
-    as the file operand to read from standard input.
-    .SH OPTIONS
-    .TP
-    .BR -h ,\  --help
-    Display help and exit.
+    reads standard input when piped input is available and no arguments are
+    given. With no arguments at a terminal, it displays usage.
+    To view a file, use cat as the command or redirect the file to standard input.
     .SH OPERANDS
     .TP
-    .I FILE
-    The file to view. Use
-    .B -
-    to read from standard input.
+    .I COMMAND [ARG]...
+    Command and arguments to capture through a PTY, without a separator.
+    .TP
+    .I 'SHELL COMMAND'
+    Shell source to execute through a PTY, including quoted pipelines.
     .SH KEYS
     .TP
     .BR q ,\  Esc ,\  Ctrl-C
@@ -121,6 +171,12 @@ man:
     .BR l ,\  Right
     Scroll right.
     .TP
+    .BR H ,\  L
+    Scroll left or right by half a viewport.
+    .TP
+    .BR 0 ,\  $
+    Go to the first or last horizontal viewport.
+    .TP
     .B /
     Search.
     .TP
@@ -136,16 +192,26 @@ man:
     or
     .BR GiB
     suffixes.
+    .TP
+    .B BLESS_COLUMNS
+    Command PTY width, from 1 to 65535 columns. Defaults to at least 160 columns.
+    .TP
+    .B SHELL
+    Fallback shell when the spawning shell cannot be identified. An unset or
+    empty value falls back to /bin/sh. Children receive the selected shell path.
     .SH EXAMPLES
     .TP
     View a file:
-    .B ${command_name} Cargo.toml
+    .B ${command_name} cat Cargo.toml
     .TP
     View coloured command output:
-    .B fastfetch --pipe false | ${command_name} -
+    .B ${command_name} fastfetch
+    .TP
+    Capture a pipeline:
+    .B ${command_name} 'printf zebra | tr a-z A-Z'
     .TP
     Raise the load cap:
-    .B BLESS_MAX_BYTES=1GiB ${command_name} huge.log
+    .B BLESS_MAX_BYTES=1GiB ${command_name} cat huge.log
     .SH SEE ALSO
     .BR less (1),
     .BR ghostty (1)

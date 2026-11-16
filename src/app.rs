@@ -17,7 +17,6 @@ use crate::{
 
 pub(crate) struct App {
     lines: Vec<Line>,
-    raw_lines: Option<Vec<String>>,
     name: String,
     notice: Option<String>,
     max_line_width: usize,
@@ -41,16 +40,10 @@ struct View {
 }
 
 impl App {
-    pub(crate) fn new(
-        lines: Vec<Line>,
-        raw_lines: Option<Vec<String>>,
-        name: String,
-        notice: Option<String>,
-    ) -> Self {
+    pub(crate) fn new(lines: Vec<Line>, name: String, notice: Option<String>) -> Self {
         let max_line_width = lines.iter().map(line_width).max().unwrap_or(0);
         Self {
             lines,
-            raw_lines,
             name: sanitize_terminal_text(&name),
             notice: notice.map(|text| sanitize_terminal_text(&text)),
             max_line_width,
@@ -127,6 +120,17 @@ impl App {
             Input::End => self.top = self.max_top(),
             Input::Right => self.left = (self.left + 4).min(self.max_left()),
             Input::Left => self.left = self.left.saturating_sub(4),
+            Input::PageRight => {
+                self.left =
+                    (self.left + (Terminal::size().0 as usize / 2).max(1)).min(self.max_left());
+            }
+            Input::PageLeft => {
+                self.left = self
+                    .left
+                    .saturating_sub((Terminal::size().0 as usize / 2).max(1));
+            }
+            Input::LineStart => self.left = 0,
+            Input::LineEnd => self.left = self.max_left(),
             Input::Search => {
                 self.prompt_search(out, tty, resize_fd)?;
                 dirty = true;
@@ -294,16 +298,6 @@ impl App {
         if idx >= self.lines.len() {
             return (String::from("\x1b[0m"), 0);
         }
-        let is_search_hit = self.search.is_some() && self.matches.binary_search(&idx).is_ok();
-        let row_width = line_width(&self.lines[idx]);
-        if self.left == 0
-            && !is_search_hit
-            && row_width <= width
-            && let Some(raw) = self.raw_lines.as_ref().and_then(|r| r.get(idx))
-            && !raw.contains('\t')
-        {
-            return (format!("\x1b[0m{}\x1b[0m", raw), row_width);
-        }
         let is_current_match = self.current_match_line() == Some(idx);
         render_line(
             &self.lines[idx],
@@ -344,9 +338,20 @@ impl App {
             .as_ref()
             .map(|n| format!("  ⚠ {n}"))
             .unwrap_or_default();
+        let first_col = (self.left + 1).min(self.max_line_width);
+        let last_col = (self.left + width).min(self.max_line_width);
         let label = format!(
-            "bless ✨  {}  lines {}-{}/{}  {}%{}{}",
-            self.name, first, last, total, pct, search, notice
+            "bless ✨  cols {}-{}/{}  {}  lines {}-{}/{}  {}%{}{}",
+            first_col,
+            last_col,
+            self.max_line_width,
+            self.name,
+            first,
+            last,
+            total,
+            pct,
+            search,
+            notice
         );
         let text = fit_width(&format!(" {label} "), width);
         let used = display_width(&text).min(width);
@@ -380,7 +385,7 @@ fn page_height() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::text::{highlight_text, parse_ansi};
+    use crate::text::parse_ansi;
 
     #[test]
     fn changed_rows_are_cleared_before_redraw() {
@@ -389,8 +394,8 @@ mod tests {
 
     #[test]
     fn ansi_rows_use_styled_renderer_when_searching() -> Result<()> {
-        let (lines, raw) = parse_ansi("\x1b[32mneedle\x1b[0m")?;
-        let mut app = App::new(lines, Some(raw), "test".into(), None);
+        let lines = parse_ansi("\x1b[32mneedle\x1b[0m")?;
+        let mut app = App::new(lines, "test".into(), None);
         app.search = Some("needle".into());
         app.rebuild_matches();
 
@@ -400,44 +405,82 @@ mod tests {
     }
 
     #[test]
-    fn caches_width_and_sanitizes_status_metadata() {
-        let lines = highlight_text("x\nabcdef", None);
-        let app = App::new(
-            lines,
-            None,
-            "bad\x1b]52;name".into(),
-            Some("bell\x07".into()),
-        );
+    fn caches_width_and_sanitizes_status_metadata() -> Result<()> {
+        let lines = parse_ansi("x\nabcdef")?;
+        let app = App::new(lines, "bad\x1b]52;name".into(), Some("bell\x07".into()));
         assert_eq!(app.max_line_width, 6);
         let (status, _) = app.render_status(80, 24);
         assert!(status.contains("bad␛]52;name"), "{status:?}");
         assert!(status.contains("bell␇"), "{status:?}");
         assert!(!status.contains("\x1b]52"), "{status:?}");
+        Ok(())
     }
 
     #[test]
     fn long_and_tabbed_ansi_rows_use_clipped_renderer() -> Result<()> {
-        let (lines, raw) = parse_ansi("\x1b[31mabcdef\x1b[0m")?;
-        let app = App::new(lines, Some(raw), "test".into(), None);
+        let lines = parse_ansi("\x1b[31mabcdef\x1b[0m")?;
+        let app = App::new(lines, "test".into(), None);
         let (rendered, used) = app.render_row(0, 4);
         assert_eq!(used, 4);
         assert!(rendered.contains("abcd"), "{rendered:?}");
         assert!(!rendered.contains("abcdef"), "{rendered:?}");
 
-        let (lines, raw) = parse_ansi("a\tb")?;
-        let app = App::new(lines, Some(raw), "test".into(), None);
+        let lines = parse_ansi("a\tb")?;
+        let app = App::new(lines, "test".into(), None);
         let (rendered, _) = app.render_row(0, 80);
         assert!(!rendered.contains('\t'), "{rendered:?}");
         Ok(())
     }
 
     #[test]
-    fn directional_keys_cycle_search_results_and_wrap() {
+    fn horizontal_views_preserve_inherited_styles_and_links() -> Result<()> {
+        use crate::text::{Style, TermColor};
+        use libghostty_vt::style::Underline;
+
+        let lines = parse_ansi(
+            "\x1b[2;3;9;4:3;38:2::17:129:231;48;5;235;58:2::201:29:137mfirst\n\x1b]8;;https://example.com\x1b\\0123456789\x1b]8;;\x1b\\\x1b[0mplain",
+        )?;
+        let mut app = App::new(lines, "test".into(), None);
+        let expected_style = Style {
+            fg: Some(TermColor::Rgb(17, 129, 231)),
+            bg: Some(TermColor::Ansi(235)),
+            underline_color: Some(TermColor::Rgb(201, 29, 137)),
+            faint: true,
+            italic: true,
+            underline: Some(Underline::Curly),
+            strikethrough: true,
+            ..Style::default()
+        };
+        for (left, width, expected) in [(0, 20, "0123456789plain"), (4, 4, "4567"), (8, 5, "89pla")]
+        {
+            app.left = left;
+            let (rendered, used) = app.render_row(1, width);
+            assert_eq!(used, expected.len());
+            let visible = parse_ansi(&format!("{rendered}!"))?;
+            assert_eq!(
+                visible[0].iter().map(|cell| cell.ch).collect::<String>(),
+                format!("{expected}!")
+            );
+            for (i, cell) in visible[0].iter().enumerate() {
+                if i < expected.len() && left + i < 10 {
+                    assert_eq!(cell.style, expected_style);
+                    assert_eq!(cell.hyperlink.as_deref(), Some("https://example.com"));
+                } else {
+                    assert_eq!(cell.style, Style::default());
+                    assert_eq!(cell.hyperlink, None);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn directional_keys_cycle_search_results_and_wrap() -> Result<()> {
         let input = (0..100)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut app = App::new(highlight_text(&input, None), None, "test".into(), None);
+        let mut app = App::new(parse_ansi(&input)?, "test".into(), None);
         app.matches = vec![10, 50, 90];
 
         assert!(app.cycle_match_for_direction(&Input::Down));
@@ -450,5 +493,6 @@ mod tests {
         assert_eq!(app.match_idx, 2);
         assert!(app.cycle_match_for_direction(&Input::Left));
         assert_eq!(app.match_idx, 1);
+        Ok(())
     }
 }

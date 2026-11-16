@@ -2,9 +2,10 @@
 name = "bless"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
 publish = false
 exclude = ["vendor/ghostty/**"]
-description = "A blessed less: Rust pager with libghostty-vt SGR parsing and syntax highlighting"
+description = "A blessed less: Rust pager with libghostty-vt terminal parsing"
 license = "MIT"
 repository = "https://github.com/th0jensen/bless"
 readme = "README.md"
@@ -15,4 +16,4 @@ categories = ["command-line-utilities"]
 anyhow = "1"
 indoc = "2.0.7"
 libc = "0.2"
-libghostty-vt = "0.2.1"
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "635b1cc037e66ebb83c9fa39db782b77cd15014d", default-features = false }

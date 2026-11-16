@@ -1,86 +1,46 @@
 use std::{
-    env, fs,
+    env,
     io::{self, Read},
     os::fd::AsRawFd,
-    path::PathBuf,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use indoc::printdoc;
 
 use crate::MAX_LOAD_BYTES;
 
 pub(crate) fn print_help(command_name: &str) {
     printdoc! {"
-        Usage: {command_name} [OPTION]... [FILE]
+        Usage: {command_name} COMMAND [ARG]...
+               {command_name} 'SHELL COMMAND'
+               COMMAND | {command_name}
 
-        bless: a small Ghostty-oriented pager with libghostty-vt SGR parsing.
+        bless: a small Ghostty-oriented pager with automatic ANSI/VT parsing.
         The installed command is a shorthand to avoid conflicting with macOS bless(8).
 
         Arguments:
-          FILE                  File to view. Use '-' to read standard input.
-                                If standard input is a pipe, FILE may be omitted.
-
-        Options:
-          -h, --help            Display this help and exit.
+          COMMAND [ARG]...      Run in a PTY, then page its terminal output.
+                                All arguments belong to the command, never files
+                                or pager options. Multiple arguments stay literal.
+          'SHELL COMMAND'       One argument runs through the spawning shell.
+                                Fallback: $SHELL, then /bin/sh.
+                                Quote pipelines and other shell syntax as one string;
+                                unquoted operators belong to the calling shell.
+                                No arguments: page stdin, or show help at a terminal.
 
         Environment:
           BLESS_MAX_BYTES=SIZE  Maximum bytes to load (default: 64MiB).
                                 SIZE accepts B, KiB, MiB, GiB suffixes.
+          BLESS_COLUMNS=COLS    Command PTY width (default: at least 160 columns).
         "
     };
 }
 
-pub(crate) fn read_limited(
-    args: &[String],
-    command_name: &str,
-) -> Result<(String, Option<PathBuf>, String, Option<String>)> {
-    if args.len() > 1 {
-        bail!(
-            "extra operand '{}'\nTry '{command_name} --help' for more information.",
-            args[1]
-        );
-    }
-    let Some(file) = args.first() else {
-        if stdin_is_tty() {
-            bail!("missing operand\nTry '{command_name} --help' for more information.");
-        }
-        return read_stdin_limited();
-    };
-    if file == "-" {
-        return read_stdin_limited();
-    }
-
-    let p = PathBuf::from(file);
-    let meta = fs::metadata(&p).with_context(|| format!("stat {file}"))?;
-    let limit = configured_max_bytes();
-    let mut f = fs::File::open(&p).with_context(|| format!("reading {file}"))?;
-    let mut bytes = Vec::with_capacity(meta.len().min(limit) as usize);
-    std::io::Read::by_ref(&mut f)
-        .take(limit)
-        .read_to_end(&mut bytes)?;
-    let notice = if meta.len() > limit {
-        Some(format!(
-            "loaded first {} of {}",
-            human_bytes(limit),
-            human_bytes(meta.len())
-        ))
-    } else {
-        None
-    };
-    Ok((
-        file.clone(),
-        Some(p),
-        String::from_utf8_lossy(&bytes).into_owned(),
-        notice,
-    ))
-}
-
-fn stdin_is_tty() -> bool {
+pub(crate) fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(io::stdin().as_raw_fd()) == 1 }
 }
 
-fn read_stdin_limited() -> Result<(String, Option<PathBuf>, String, Option<String>)> {
+pub(crate) fn read_stdin_limited() -> Result<(String, Vec<u8>, Option<String>)> {
     let limit = configured_max_bytes();
     let mut stdin = io::stdin();
     let mut bytes = Vec::new();
@@ -102,19 +62,22 @@ fn read_stdin_limited() -> Result<(String, Option<PathBuf>, String, Option<Strin
         total += n as u64;
     }
     let notice = truncated.then(|| format!("stdin capped at {}", human_bytes(limit)));
-    Ok((
-        "stdin".into(),
-        None,
-        String::from_utf8_lossy(&bytes).into_owned(),
-        notice,
-    ))
+    Ok(("stdin".into(), bytes, notice))
 }
 
-fn configured_max_bytes() -> u64 {
+pub(crate) fn configured_max_bytes() -> u64 {
     env::var("BLESS_MAX_BYTES")
         .ok()
         .and_then(|v| parse_bytes(&v))
         .unwrap_or(MAX_LOAD_BYTES)
+}
+
+pub(crate) fn command_columns(viewport: u16) -> u16 {
+    env::var("BLESS_COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(viewport.max(160))
 }
 
 fn parse_bytes(s: &str) -> Option<u64> {
@@ -132,7 +95,7 @@ fn parse_bytes(s: &str) -> Option<u64> {
     n.checked_mul(multiplier)
 }
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
     let mut u = 0;
