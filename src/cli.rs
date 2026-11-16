@@ -40,15 +40,14 @@ pub(crate) fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(io::stdin().as_raw_fd()) == 1 }
 }
 
-pub(crate) fn read_stdin_limited() -> Result<(String, Vec<u8>, Option<String>)> {
+pub(crate) fn read_limited(mut reader: impl Read, name: &str) -> Result<(Vec<u8>, Option<String>)> {
     let limit = configured_max_bytes();
-    let mut stdin = io::stdin();
     let mut bytes = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0u64;
     let mut truncated = false;
     loop {
-        let n = stdin.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -61,8 +60,8 @@ pub(crate) fn read_stdin_limited() -> Result<(String, Vec<u8>, Option<String>)> 
         bytes.extend_from_slice(&buf[..n]);
         total += n as u64;
     }
-    let notice = truncated.then(|| format!("stdin capped at {}", human_bytes(limit)));
-    Ok(("stdin".into(), bytes, notice))
+    let notice = truncated.then(|| format!("{name} capped at {}", human_bytes(limit)));
+    Ok((bytes, notice))
 }
 
 pub(crate) fn configured_max_bytes() -> u64 {

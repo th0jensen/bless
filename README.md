@@ -17,9 +17,9 @@
 
 ## Build
 
-Requires Rust 1.96+ and [Zig](https://ziglang.org) 0.17.0. The Rust bindings are pinned to upstream revision `635b1cc037e66ebb83c9fa39db782b77cd15014d`, paired with their Ghostty `vt-1.0.0` revision `0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec`. `libghostty-vt` is built from source and statically linked: `.cargo/config.toml` points its build script at the matching `vendor/ghostty` submodule. Kitty graphics are disabled; this pager renders text cells.
+Requires Rust 1.96+ and [Zig](https://ziglang.org) 0.17.0. The Rust bindings are pinned to upstream revision `483ea3d5247b214060da58ef6037a95f30ae89fb`, paired with their Ghostty `vt-1.0.1` revision `108cacb17ed8990840cd14abfce43d8ed8503ca1`. `libghostty-vt` is built from source and statically linked: `.cargo/config.toml` points its build script at the matching `vendor/ghostty` submodule. Kitty graphics are disabled; this pager renders text cells.
 
-The resulting binary has no runtime dependency on a system or bundled `libghostty-vt` — it's statically linked in. Runtime dependencies are intentionally tiny: just `anyhow` and `libc`. Cargo source packages exclude the large upstream submodule, and this source-coupled crate is intentionally not published to crates.io.
+The resulting binary has no runtime dependency on a system or bundled `libghostty-vt` — it's statically linked in. Runtime dependencies are intentionally tiny: just `anyhow` and `libc`. Cargo source packages exclude the large upstream submodule. Registry publication is currently gated on a matching upstream bindings release; see [Publication](#publication).
 
 When updating the Rust bindings, update `vendor/ghostty` to the exact revision pinned by their build script. Updating Ghostty alone to an unrelated tip can break the C ABI; `just update-ghostty` is only useful for deliberately testing such an upgrade.
 
@@ -35,6 +35,35 @@ cargo build --release
 
 If you already cloned without `--recurse-submodules`, run `git submodule update --init` first.
 
+## Use as a library
+
+The Cargo package is `bless-pager`; the Rust library is `bless`. Git dependencies do not require `publish = true` or a registry release:
+
+```toml
+[dependencies]
+bless = { package = "bless-pager", git = "https://github.com/th0jensen/bless" }
+```
+
+Pin `rev` to the Bless commit you have tested for reproducible builds. A git consumer still needs Rust and Zig as above. Cargo does not inherit this repository's `.cargo/config.toml` when Bless is a dependency; the bindings' build script fetches its own exact pinned Ghostty source instead.
+
+```rust
+// Suspend your own terminal UI and leave its raw/alternate-screen mode first.
+bless::page_text("Application logs", "\x1b[31merror\x1b[0m\n")?;
+// Or supply any std::io::Read, without redirecting process stdin:
+bless::page_reader("Application logs", std::fs::File::open("app.log")?)?;
+// Resume your terminal UI after the result has been handled, even on error.
+```
+
+Both entry points block until the user quits, preserve ANSI/VT styling, and restore terminal state before returning. They use stdout for rendering and `/dev/tty` for keys; stdout must be the terminal being paged. They must not overlap another terminal UI. Input is read before entering raw mode; reader errors are returned without opening the pager. Readers must reach EOF: this is not a live-log viewer. The same `BLESS_MAX_BYTES` cap (64 MiB by default), line cap, and truncation notices as the CLI apply.
+
+## Publication
+
+`bless-pager` is the intended registry name because crates.io's `bless` is an unrelated project. The executable remains `bless`, installed as `bls`. No registry release has been made, and `publish = false` deliberately prevents publishing an unusable package.
+
+A crates.io consumer cannot publish with a git-only dependency, even when that dependency is itself publishable. The matching `libghostty-vt` and `libghostty-vt-sys` sources must first be released to the registry. The registry's current `0.2.2` releases are **not** the sources pinned above: they use bindings commit `c9876b2902d5bb3e1f3d61b6395059f1e5e7b721`, Ghostty `a887df42c56f6de86c0fe6da9c4eeca37931e083`, and the older Rust API. Adding their version to the git dependency would make Cargo package different, incompatible sources.
+
+The release path is to obtain compatible upstream registry releases for the pinned pair, replace the git dependency with that verified registry version, remove `publish = false`, and run `cargo package` plus `cargo publish --dry-run` before an approved publication. After `bless-pager` itself is released, a downstream crates.io package can use `bless = { package = "bless-pager", version = "0.1" }`. Until then, use the git dependency for development only; publishing downstream is blocked. Maintaining and publishing renamed forks of both bindings crates would be a separate alternative, not an implicit side effect of this library extraction.
+
 ## Install from source
 
 ```sh
@@ -43,7 +72,7 @@ just install
 
 `just install` (or bare `just`, which builds the release binary and man page) detects the host platform without an explicit Cargo `--target`. Source installs avoid system/package-manager prefixes by default: `~/.local` on Linux/other Unix and `~/opt` on macOS.
 
-macOS already ships Apple's `/usr/sbin/bless` utility. To avoid shadowing a system administration command while keeping one command name across platforms, the installed command shorthand is `bls` everywhere. The program, project, and package are still named `bless`. Override `INSTALL_NAME`, `PREFIX`, `BINDIR`, or `MANDIR` if needed; packaging recipes should set their own prefix explicitly.
+macOS already ships Apple's `/usr/sbin/bless` utility. To avoid shadowing a system administration command while keeping one command name across platforms, the installed command shorthand is `bls` everywhere. The program, project, and Rust library are still named `bless`; the Cargo package is `bless-pager`. Override `INSTALL_NAME`, `PREFIX`, `BINDIR`, or `MANDIR` if needed; packaging recipes should set their own prefix explicitly.
 
 ## Run
 

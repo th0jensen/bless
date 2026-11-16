@@ -15,7 +15,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
-name = "bless"
+name = "bless-pager"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -54,7 +54,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libghostty-vt"
 version = "0.2.1"
-source = "git+https://github.com/uzaaft/libghostty-rs?rev=635b1cc037e66ebb83c9fa39db782b77cd15014d#635b1cc037e66ebb83c9fa39db782b77cd15014d"
+source = "git+https://github.com/uzaaft/libghostty-rs?rev=483ea3d5247b214060da58ef6037a95f30ae89fb#483ea3d5247b214060da58ef6037a95f30ae89fb"
 dependencies = [
  "bitflags",
  "int-enum",
@@ -64,7 +64,7 @@ dependencies = [
 [[package]]
 name = "libghostty-vt-sys"
 version = "0.2.1"
-source = "git+https://github.com/uzaaft/libghostty-rs?rev=635b1cc037e66ebb83c9fa39db782b77cd15014d#635b1cc037e66ebb83c9fa39db782b77cd15014d"
+source = "git+https://github.com/uzaaft/libghostty-rs?rev=483ea3d5247b214060da58ef6037a95f30ae89fb#483ea3d5247b214060da58ef6037a95f30ae89fb"
 
 [[package]]
 name = "proc-macro2"

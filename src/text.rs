@@ -3,10 +3,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use libghostty_vt::{
     Error, RenderState, Terminal,
+    color::{Palette, Rgb},
+    grid_ref::GridRef,
+    mode::Mode,
+    point::{Coordinate, Point},
     render::{CellIterator, RowIterator},
-    screen::{CellContentTag, CellWide, GridRef},
-    style::{Palette, RgbColor, StyleColor, Underline},
-    terminal::{Mode, Point, PointCoordinate, ScrollViewport},
+    screen::{CellContentTag, CellWide},
+    style::{StyleColor, Underline},
+    terminal::ScrollViewport,
 };
 
 use crate::MAX_LINES;
@@ -182,7 +186,7 @@ pub(crate) fn snapshot_lines(terminal: &mut Terminal<'_, '_>) -> Result<Vec<Line
                 };
                 let style = colors.style(style);
                 let hyperlink = if raw.has_hyperlink()? {
-                    let grid = terminal.grid_ref(Point::Viewport(PointCoordinate {
+                    let grid = terminal.grid_ref(Point::Viewport(Coordinate {
                         x: column,
                         y: y as u32,
                     }))?;
@@ -251,15 +255,15 @@ fn read_hyperlink(grid: &GridRef<'_>, buf: &mut Vec<u8>) -> Result<Option<Arc<st
 }
 
 struct Colors {
-    fg: Option<RgbColor>,
-    bg: Option<RgbColor>,
+    fg: Option<Rgb>,
+    bg: Option<Rgb>,
     palette: Palette,
     defaults: Palette,
     reverse: bool,
 }
 
 impl Colors {
-    fn color(&self, color: StyleColor, default: Option<RgbColor>) -> Option<TermColor> {
+    fn color(&self, color: StyleColor, default: Option<Rgb>) -> Option<TermColor> {
         match color {
             StyleColor::None => default.map(|c| TermColor::Rgb(c.r, c.g, c.b)),
             StyleColor::Rgb(c) => Some(TermColor::Rgb(c.r, c.g, c.b)),
