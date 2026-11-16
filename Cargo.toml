@@ -1,8 +1,9 @@
 [package]
-name = "bless"
+name = "bless-pager"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
+# Keep the registry release gated until the matched libghostty pair is published.
 publish = false
 exclude = ["vendor/ghostty/**"]
 description = "A blessed less: Rust pager with libghostty-vt terminal parsing"
@@ -12,8 +13,15 @@ readme = "README.md"
 keywords = ["pager", "terminal", "less", "ghostty"]
 categories = ["command-line-utilities"]
 
+[lib]
+name = "bless"
+
+[[bin]]
+name = "bless"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 indoc = "2.0.7"
 libc = "0.2"
-libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "635b1cc037e66ebb83c9fa39db782b77cd15014d", default-features = false }
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", default-features = false }

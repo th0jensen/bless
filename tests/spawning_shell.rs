@@ -26,6 +26,66 @@ impl Drop for ShellChild {
 }
 
 #[test]
+fn library_pages_supplied_content_and_restores_terminal() -> Result<()> {
+    if let Ok(mode) = std::env::var("BLESS_TEST_LIBRARY_INPUT") {
+        let mut before = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(0, &mut before) }, 0);
+        let text = "abc\x1b[31mRED\x1b[0m\n";
+        if mode == "text" {
+            bless::page_text("Log", text)?;
+        } else {
+            bless::page_reader("Log", io::Cursor::new(text.as_bytes()))?;
+        }
+        let mut after = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(0, &mut after) }, 0);
+        assert_eq!(after.c_iflag, before.c_iflag);
+        assert_eq!(after.c_oflag, before.c_oflag);
+        assert_eq!(after.c_cflag, before.c_cflag);
+        assert_eq!(after.c_lflag, before.c_lflag);
+        assert_eq!(after.c_cc, before.c_cc);
+        return Ok(());
+    }
+
+    for mode in ["text", "reader", "capped"] {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "library_pages_supplied_content_and_restores_terminal",
+                "--nocapture",
+            ])
+            .env("BLESS_TEST_LIBRARY_INPUT", mode)
+            .env_remove("BLESS_MAX_BYTES");
+        if mode == "capped" {
+            command.env("BLESS_MAX_BYTES", "3B");
+        }
+        let output = run_in_pty(command, 0)?;
+        assert!(output.contains("Log"), "{output}");
+        assert!(output.contains("abc"), "{output}");
+        if mode == "capped" {
+            assert!(output.contains("capped at 3 B"), "{output}");
+            assert!(!output.contains("RED"), "{output}");
+        } else {
+            assert!(output.contains("\x1b[0;31mRED"), "{output}");
+        }
+        assert!(output.contains("\x1b[?1049l"), "{output}");
+    }
+    Ok(())
+}
+
+#[test]
+fn library_returns_reader_errors_before_opening_the_pager() {
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("log reader failed"))
+        }
+    }
+    let error = bless::page_reader("Broken log", FailingReader).unwrap_err();
+    assert_eq!(error.to_string(), "log reader failed");
+}
+
+#[test]
 fn uses_the_spawning_shell_instead_of_a_stale_shell_variable() -> Result<()> {
     let mut command = Command::new("/bin/sh");
     command

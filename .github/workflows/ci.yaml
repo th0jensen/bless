@@ -21,7 +21,7 @@ jobs:
           components: rustfmt, clippy
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
         with:
-          version: 0.17.0
+          version: 0.17.1
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
