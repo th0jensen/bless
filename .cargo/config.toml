@@ -1,3 +1,4 @@
 [env]
-# Match the Ghostty revision pinned by libghostty-vt-sys (Zig 0.17).
+# Temporary tested Ghostty-tip override; libghostty-vt-sys still pins vt-1.0.1.
+# Keep library consumers' GHOSTTY_SOURCE_DIR on this same submodule revision.
 GHOSTTY_SOURCE_DIR = { value = "vendor/ghostty", relative = true }

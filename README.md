@@ -17,11 +17,11 @@
 
 ## Build
 
-Requires Rust 1.96+ and [Zig](https://ziglang.org) 0.17.0. The Rust bindings are pinned to upstream revision `483ea3d5247b214060da58ef6037a95f30ae89fb`, paired with their Ghostty `vt-1.0.1` revision `108cacb17ed8990840cd14abfce43d8ed8503ca1`. `libghostty-vt` is built from source and statically linked: `.cargo/config.toml` points its build script at the matching `vendor/ghostty` submodule. Kitty graphics are disabled; this pager renders text cells.
+Requires Rust 1.96+ and [Zig](https://ziglang.org) 0.17.1. Ghostty tip rejects Zig 0.17.0. The Rust bindings are pinned to upstream tip `483ea3d5247b214060da58ef6037a95f30ae89fb`, paired with Ghostty tip `5ebe501a63425b13d9952e8c54682c046386e5af` (VT 1.0.2 headers). These are fixed snapshots of both tips, not moving branches. `libghostty-vt` is built from source and statically linked: `.cargo/config.toml` temporarily overrides the bindings' own Ghostty `vt-1.0.1` pin (`108cacb17ed8990840cd14abfce43d8ed8503ca1`) with the tested `vendor/ghostty` checkout until upstream catches up. Kitty graphics are disabled; this pager renders text cells.
 
 The resulting binary has no runtime dependency on a system or bundled `libghostty-vt` — it's statically linked in. Runtime dependencies are intentionally tiny: just `anyhow` and `libc`. Cargo source packages exclude the large upstream submodule. Registry publication is currently gated on a matching upstream bindings release; see [Publication](#publication).
 
-When updating the Rust bindings, update `vendor/ghostty` to the exact revision pinned by their build script. Updating Ghostty alone to an unrelated tip can break the C ABI; `just update-ghostty` is only useful for deliberately testing such an upgrade.
+When updating either tip, recheck C API compatibility and run the full test suite against that exact pair. The current override changes no public C declarations relative to the bindings' Ghostty pin, only the header version macros; it is not a compatibility promise for future tips. Keep library consumers on the same Ghostty override, or return to the upstream-pinned pair once appropriate. After moving `vendor/ghostty`, run `cargo clean -p libghostty-vt-sys` before rebuilding: the upstream build script does not track changes inside the overridden source checkout. `just update-ghostty` moves only the submodule and does not perform these checks.
 
 Large-file safeguards: `bless` loads at most 64 MiB by default, stores styled text as compact runs, and caps parsed lines at 1,000,000. Override bytes with `BLESS_MAX_BYTES`, e.g. `BLESS_MAX_BYTES=256MiB bls cat huge.log`.
 
@@ -44,7 +44,14 @@ The Cargo package is `bless-pager`; the Rust library is `bless`. Git dependencie
 bless = { package = "bless-pager", git = "https://github.com/th0jensen/bless" }
 ```
 
-Pin `rev` to the Bless commit you have tested for reproducible builds. A git consumer still needs Rust and Zig as above. Cargo does not inherit this repository's `.cargo/config.toml` when Bless is a dependency; the bindings' build script fetches its own exact pinned Ghostty source instead.
+Pin `rev` to the Bless commit you have tested for reproducible builds. A git consumer still needs Rust and Zig as above. Cargo does not inherit this repository's `.cargo/config.toml` when Bless is a dependency. To use the same temporary tip-to-tip pair, check out Ghostty `5ebe501a63425b13d9952e8c54682c046386e5af` in the consuming project's `vendor/ghostty` and add this to **its** `.cargo/config.toml`:
+
+```toml
+[env]
+GHOSTTY_SOURCE_DIR = { value = "vendor/ghostty", relative = true }
+```
+
+Alternatively, set `GHOSTTY_SOURCE_DIR` to that checkout's absolute path in the consuming build environment. Without an override, the bindings fetch their older `108cacb17ed8990840cd14abfce43d8ed8503ca1` pin instead; updating Bless's submodule alone does not update a downstream build. Remove the temporary override only after verifying the bindings' new default source. Clean `libghostty-vt-sys` when changing the overridden source, as described above.
 
 ```rust
 // Suspend your own terminal UI and leave its raw/alternate-screen mode first.
